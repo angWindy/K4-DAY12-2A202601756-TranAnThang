@@ -1,23 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════
-# CP2 — Stack chạy ở máy bạn: chat + redis (+ nginx nếu làm phần cộng điểm)
+# CP2 — Stack chạy ở máy bạn: chat + redis (+ nginx làm điểm cộng)
 #
-# Service `redis` đã cho sẵn — chạy ngay từ Block 1 để có Redis mà code:
-#     docker compose up -d redis
+# Quy ước:
+#   - Service `redis` chạy riêng (đã có sẵn healthcheck).
+#   - Service `chat` build từ Dockerfile, KHÔNG public port (chỉ nginx
+#     mới map port 8000 ra host). Làm vậy để có thể scale chat=N mà
+#     không bị xung đột cổng.
+#   - Service `nginx` làm load balancer, expose cổng duy nhất 8000 ra host.
 #
-# NHIỆM VỤ: bổ sung service `chat`. Yêu cầu:
-#   [ ] build từ Dockerfile trong thư mục hiện tại
-#   [ ] map cổng ra ngoài (8000:8000)
-#   [ ] KHÔNG viết secret thẳng vào file này — dùng nội suy biến môi trường
-#       `${API_TOKEN}` (docker compose tự đọc từ file .env cùng thư mục)
-#   [ ] REDIS_URL trỏ tới `redis://redis:6379/0` — trong compose, tên service
-#       chính là hostname
-#   [ ] depends_on: redis
-#   [ ] healthcheck gọi /healthz
-#
-# ĐIỂM CỘNG: thêm service `nginx` làm load balancer (nginx/nginx.conf đã có sẵn)
-#     docker compose up --scale chat=3
-#
-# Kiểm tra: pytest tests/test_cp2.py -v
+# Compose tự đọc file .env ở cùng thư mục. API_TOKEN được truyền qua
+# nội suy biến — KHÔNG hardcode.
 # ═══════════════════════════════════════════════════════════════════
 
 services:
@@ -34,10 +26,36 @@ services:
       timeout: 3s
       retries: 5
 
-  # TODO (CP2): khai báo service `chat` ở đây
-  # chat:
-  #   build: .
-  #   ...
+  chat:
+    build: .
+    expose:
+      - "8000"
+    environment:
+      # `:?` sẽ fail compose nếu biến chưa được set — fail-fast tốt hơn
+      # chạy với token rỗng.
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      REDIS_URL: redis://redis:6379/0
+      PORT: "8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Image slim không có curl — dùng Python để gọi /healthz.
+      test: ["CMD", "python", "-c", "import os, urllib.request; port = os.getenv('PORT', '8000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Điểm cộng: nginx làm load balancer, scale chat=3 mà host chỉ cần 1 cổng
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - chat
 
 volumes:
   redis-data:
