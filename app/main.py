@@ -166,7 +166,38 @@ def chat(
     ``client_id`` do ``verify_bearer_token`` trả về, nên request không có
     token hợp lệ sẽ dừng ở 401 trước khi chạm vào bất cứ dòng nào ở đây.
     """
-    raise NotImplementedError("TODO (CP3/CP4): cài đặt /chat")
+    # 1. Rate limit: chặn spam — fail-fast trước khi tốn tài nguyên
+    bucket.consume(client_id)
+    # 2. Cost guard: chặn trước khi gọi LLM để không đốt tiền oan
+    guard.check(client_id)
+    # 3. Đọc lịch sử để LLM có ngữ cảnh
+    history = store.history(client_id)
+    # 4. Gọi mock LLM (production sẽ thay bằng OpenAI/Anthropic API)
+    result = generate_reply(payload.message, history)
+    # 5. Lưu 2 lượt hội thoại vào Redis
+    store.add_turn(client_id, "user", payload.message)
+    store.add_turn(client_id, "assistant", result["text"])
+    # 6. Cộng dồn chi phí thực tế
+    guard.record(client_id, result["usd_cost"])
+    # 7. Structured log
+    emit(
+        "chat_completed",
+        client_id=client_id,
+        prompt_tokens=result["prompt_tokens"],
+        completion_tokens=result["completion_tokens"],
+        usd_cost=result["usd_cost"],
+    )
+    # 8. Trả response
+    return {
+        "reply": result["text"],
+        "client_id": client_id,
+        "turns_before": len(history),
+        "usd_cost": result["usd_cost"],
+        "usage": {
+            "prompt": result["prompt_tokens"],
+            "completion": result["completion_tokens"],
+        },
+    }
 
 
 if __name__ == "__main__":

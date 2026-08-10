@@ -198,7 +198,30 @@ Vì sao 401 phải kèm header `WWW-Authenticate: Bearer`? Và vì sao ta trả 
 một** thông báo lỗi cho cả ba trường hợp (thiếu header, sai scheme, sai token)
 thay vì nói rõ sai ở đâu cho người dùng dễ sửa?
 
-> *Câu trả lời của bạn*
+> **`WWW-Authenticate: Bearer` là bắt buộc theo chuẩn HTTP (RFC 7235 / 6750),**
+> không phải tuỳ chọn. Khi server trả 401, *đặc tả HTTP* yêu cầu phải chỉ cho
+> client biết "cách xác thực hợp lệ là gì" — header đó là phương tiện làm
+> chuyện đó. Bỏ qua là vi phạm chuẩn: HTTP client (axios, requests, SDK các
+> ngôn ngữ) sẽ không tự động biết phải gửi lại request với scheme nào, có thể
+> trả về lỗi chung chung cho người dùng thay vì gợi ý "thêm Bearer token".
+> Thực tế: GitHub, Stripe, OpenAI, Google Cloud — tất cả đều trả
+> `WWW-Authenticate: Bearer ...` trên 401.
+>
+> **Trả cùng một thông báo** (`"invalid or missing bearer token"`) cho cả 3
+> trường hợp vì đây là nguyên tắc **không tiết lộ thông tin cho attacker**:
+>
+> - Nếu nói "thiếu header" → attacker biết phải thêm header.
+> - Nếu nói "sai scheme" → attacker biết token của họ đã đúng, chỉ cần đổi
+>   `Bearer` → `Basic` để vượt qua lớp scheme và tiếp tục brute-force token.
+> - Nếu nói "sai token" → attacker xác nhận scheme đúng, tập trung toàn lực
+>   brute-force token (còn thử với `Basic` chỉ phí thời gian).
+>
+> Mỗi thông báo riêng biệt vô tình trở thành **"kẻ dò miễn phí"** cho
+> attacker: 3 response khác nhau = log₂(3) ≈ 1.6 bit thông tin mỗi lần thử,
+> giảm không gian tìm kiếm xuống rất nhanh. Cùng một thông báo buộc attacker
+> phải đoán mù — không cho họ biết "mình sai ở đâu". Client hợp lệ (do
+> developer viết) đọc HTTP status + `WWW-Authenticate` đã đủ biết phải fix;
+> họ không cần server đọc hộ từng trường hợp.
 
 ---
 
@@ -208,7 +231,40 @@ Với `capacity=10`, `refill_per_minute=10`: một client im lặng 10 phút r�
 liên tiếp. Nó gửi được bao nhiêu request trước khi bị 429? Nếu bỏ đoạn
 `min(capacity, ...)` trong `available()` thì con số đó thành bao nhiêu, và tại sao?
 
-> *Câu trả lời của bạn*
+> **Có `min(capacity, ...)`:** client gửi được **10 request** rồi mới bị
+> 429 ở request thứ 11.
+>
+> Giải thích: client im lặng 10 phút = 600 giây. Trong 600 giây, lý thuyết
+> xô được nạp thêm `600 × (10/60) = 100 token`. **Nhưng** `capacity = 10`
+> nên `min(capacity, ...)` chặn xô ở tối đa 10 token — đúng bằng sức chứa.
+> Khi bắn liên tiếp, refill gần như 0 (vài ms mỗi request), nên xô cạn
+> đúng sau 10 token. **Tôi đã chạy thật bằng fakeredis:**
+> ```
+> bị chặn ở request thứ 11: rate limit exceeded
+> CÓ min(capacity, ...): 10 requests thành công
+> ```
+>
+> **Nếu bỏ `min(capacity, ...)`:** client gửi được **100 request** trước
+> khi 429, gấp 10 lần `capacity`. Trên thực tế còn tệ hơn: sau khi cạn,
+> xô vẫn tiếp tục được nạp 10 token mỗi phút, client có thể bắn 10 + 10 +
+> 10 + ... = một dòng chảy request liên tục cho tới khi attacker chán.
+>
+> **Tại sao điều này nguy hiểm:**
+> 1. **Tăng gấp `seconds × refill_per_second / capacity` lần** sức công
+>    kích mỗi lần client im lặng. Client im lặng 1 ngày (86400s) sẽ tích
+>    được `86400 × 10/60 = 14400 token` — đủ để bắn **8 request/giây** liên
+>    tục cả ngày, vượt xa `refill_per_minute=10` thiết kế ban đầu.
+> 2. **Đảo ngược mục đích rate limit:** rate limit được sinh ra để chặn
+>    kẻ gọi nhanh, nhưng nếu bỏ cap thì nó lại **trao thưởng** cho kẻ
+>    chịu chờ — kẻ "kiên nhẫn" nhất lại có sức công kích mạnh nhất.
+> 3. **Tăng blast radius khi container restart:** nếu Redis bị mất và phục
+>    hồi sau vài giờ, tất cả client đồng loạt có xô "đầy lại" vượt cap
+>    (vì giờ `tokens = 0 + (now - last) × refill_per_second` rất lớn).
+>    Có cap → tất cả xô đều giới hạn ở `capacity`, an toàn.
+>
+> **Tóm lại:** `min(capacity, ...)` biến token bucket từ "tích lũy vô hạn"
+> thành "tích lũy có trần" — đây là điểm khác biệt giữa rate limit hữu ích
+> và DDoS vector.
 
 ---
 
@@ -218,7 +274,50 @@ So sánh hạn mức $30/tháng với hạn mức $1/ngày cho cùng một clien
 cố khiến một client gọi liên tục từ 2h sáng. Với mỗi cách, thiệt hại tối đa là
 bao nhiêu và service tự hồi phục khi nào?
 
-> *Câu trả lời của bạn*
+> **Cùng điều kiện:** client gọi liên tục từ 02:00 UTC, mỗi request tốn
+> ~$0.001 (tương đương prompt 1000 token + completion 500 token theo bảng
+> giá `mock_llm.py`). Sự cố được phát hiện lúc 09:00 sáng khi admin đọc
+> dashboard = **7 giờ liên tục** = 7 × 3600 = 25.200 request.
+>
+> **Hạn mức $30/tháng:**
+> - Trước 02:00 tháng đó client đã tiêu: $0 (đầu tháng).
+> - 25.200 request × $0.001 = **$25.20** — thấp hơn budget $30, **chưa bị
+>   chặn**, cost guard vẫn cho qua.
+> - **Thiệt hại tối đa:** $30.001 (khi đạt đúng budget + 1 request cuối
+>   vì cost guard là *soft quota* — `check()` ở đầu, `record()` ở cuối).
+> - **Tự hồi phục:** **phải đợi cuối tháng** (hoặc admin đặt lại key
+>   `spend:<client>:<YYYY-MM>` thủ công). Khoảng **28 ngày** nếu sự cố xảy
+>   ra ngày 1, **1 ngày** nếu xảy ra ngày cuối tháng.
+> - Hậu quả: budget tháng đã cháy $30 → 30 ngày còn lại trong tháng đó
+>   client không thể gọi được nữa (admin phải chờ tháng sau hoặc tăng
+>   budget thủ công).
+>
+> **Hạn mức $1/ngày (cách làm của lab này):**
+> - Cùng sự cố 7 giờ, **$25.20 > $1** → bị chặn ngay sau khoảng
+>   1.000 request (= $1.0) tức là sau ~17 phút từ lúc 02:00. Từ đó
+>   trở đi cost guard raise 402.
+> - **Thiệt hại tối đa:** **$1.001** (1 request cuối sau khi pass check).
+> - **Tự hồi phục:** **00:00 UTC ngày hôm sau** (tức ~22 giờ sau khi sự
+>   cố bắt đầu), key `spend:<client>:<YYYY-MM-DD>` đổi sang ngày mới,
+>   `spent()` trả về `0.0`, client gọi lại bình thường. **Không cần ai
+>   can thiệp.**
+>
+> **So sánh:**
+>
+> | Tiêu chí | $30/tháng | $1/ngày |
+> |----------|-----------|---------|
+> | Thiệt hại tối đa / sự cố | ~$30 | ~$1.001 |
+> | Thời gian hồi phục tự động | 1–28 ngày | ~22h |
+> | Cần admin can thiệp? | Có | Không |
+> | Trong ví dụ 7h spam | **$25.20** (chưa chặn) | **$1.001** (đã chặn) |
+> | Ngân sách còn lại trong kỳ | 0 | Phục hồi đầy đủ mỗi ngày |
+>
+> **Kết luận:** budget theo ngày giới hạn *thiệt hại tối đa* của một sự cố
+> xuống 1/30 so với theo tháng, và tự hồi phục không cần ai đụng vào. Đổi
+> lại, hạn mức ngày dễ "reset giữa chừng" nếu client hợp lệ có workload
+> đột biến cuối ngày — nhưng khoản đó vẫn tốt hơn nhiều so với việc cháy
+> $30 vào 2h sáng. Đây cũng là lý do lab chọn `daily_budget_usd` thay vì
+> `monthly_budget_usd`.
 
 ---
 
