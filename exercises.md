@@ -326,7 +326,114 @@ bao nhiêu và service tự hồi phục khi nào?
 Nếu gộp hai endpoint làm một và cho nó kiểm tra Redis, chuyện gì xảy ra với cụm
 3 container khi Redis mất kết nối 30 giây? Trả lời theo đúng thứ tự sự kiện.
 
-> *Câu trả lời của bạn*
+> **Giả định:** cụm 3 container `agent_1/2/3` đang chạy ổn định, Nginx
+> upstream đang round-robin traffic vào cả 3 instance, Redis pod `redis-0`
+> ở cùng cluster K8s. Endpoint gộp `/health` kiểm tra `redis.ping()`.
+>
+> **T=0s — Redis bắt đầu mất kết nối** (network partition, OOM kill, swap,
+> chậm GC… tuỳ nguyên nhân).
+>
+> **T+0–1s — Tất cả 3 container nhận request vẫn trả response bình thường**
+> cho những request đang xử lý dở (đã qua bước auth + rate limit). Nhưng
+> request mới gọi `/health` bắt đầu timeout ~1s (TCP read timeout).
+>
+> **T+1–2s — Health probe fail đồng loạt** trên cả 3 container:
+> - K8s liveness probe thấy fail → đánh dấu container "unhealthy".
+> - Nginx health check (nếu cấu hình) cũng thấy fail → ngừng route traffic.
+> - **Vấn đề:** request đến `/chat` cũng bắt đầu lỗi 500 (vì `store.ping()`
+>   hoặc `store.history()` raise exception), kể cả những request không liên
+>   quan tới logic bị lỗi — ví dụ rate-limit check vẫn chạy nhưng `add_turn`
+>   ném `ConnectionError`.
+>
+> **T+5–10s — K8s quyết định restart** vì liveness probe fail liên tục:
+> - Container `agent_1` bị kill, khởi động lại. Khi khởi động lại, **lần
+>   `/health` đầu tiên cũng fail** (vì Redis vẫn chưa lên) → K8s đánh dấu
+>   `CrashLoopBackOff`, back-off 5s → 10s → 20s → 40s.
+> - Tương tự với `agent_2`, `agent_3` — cả 3 lần lượt bị kill và rơi vào
+>   back-off. **Toàn bộ cụm down**, mặc dù bản thân 3 container process vẫn
+>   khoẻ mạnh.
+>
+> **T+15–20s — Nginx mất hoàn toàn upstream**: `agent_1/2/3` đều trong
+> CrashLoopBackOff, Nginx trả 502 Bad Gateway cho mọi request từ user.
+>
+> **T+30s — Redis phục hồi** (network ổn định lại, hoặc pod mới lên).
+>
+> **T+30s đến T+90s — Quay lại từ từ:**
+> - K8s lần lượt cho các container retry: `agent_1` lên sau back-off ~20s,
+>   lần `/health` này pass → chuyển sang `Ready`. Nginx route traffic lại.
+> - Nhưng `agent_2` và `agent_3` vẫn đang back-off → Nginx chỉ có 1/3
+>   upstream, tải dồn lên container đó.
+> - Sau ~90s, cả 3 mới hoàn toàn ổn định trở lại.
+>
+> **Tổng thiệt hại:** **~30 giây downtime thật + ~60 giây degraded
+> capacity** = tổng cộng ~90 giây user gặp sự cố, dù bản thân Redis chỉ
+> chết 30 giây.
+>
+> **Đây là lý do cần tách `/healthz` (liveness) và `/readyz` (readiness):**
+>
+> | Endpoint | Vai trò | Phụ thuộc Redis? | Khi Redis chết |
+> |----------|---------|------------------|----------------|
+> | `/healthz` | "Process còn sống không?" — K8s dùng để quyết định **restart** | **KHÔNG** | Vẫn 200 → K8s không kill container |
+> | `/readyz` | "Có sẵn sàng nhận traffic không?" — K8s/Nginx dùng để quyết định **route** | **CÓ** (gọi `store.ping()`) | 503 → K8s bỏ khỏi Service endpoints, Nginx ngừng route, **nhưng container vẫn chạy** |
+>
+> Khi tách đúng:
+> - Redis chết 30s → 3 container `/healthz` vẫn 200 → K8s **không restart**.
+> - `/readyz` 3 container trả 503 → Nginx ngừng route → user thấy 502 ngay,
+>   **nhưng container không chết**.
+> - Redis lên → `/readyz` 200 lại → Nginx route traffic trở lại trong **<1s**,
+>   không cần restart, không CrashLoopBackOff.
+> - **Tổng downtime thật:** ~30s (đúng bằng thời gian Redis chết), không
+>   kéo dài thành 90s như cách gộp.
+>
+> **Tóm lại:** gộp `/healthz` + `/readyz` biến một sự cố phục hồi nhanh
+> (Redis chết 30s) thành sự cố kéo dài gấp 3 lần (90s vì restart loop),
+> và còn để lại `CrashLoopBackOff` state trên cả cụm. Tách endpoint là cách
+> duy nhất để K8s phân biệt được "cần restart process" với "cần ngừng route
+> tới process".
+
+> **Phản ánh thêm (CP4) — Stateless với 3 replica:** Nếu lịch sử chat được
+> lưu trong dict Python (ví dụ `_HISTORY: dict[str, list] = {}` trong
+> `app/main.py`) thay vì Redis, khi chạy `docker compose up -d --scale
+> agent=3`, user gọi 5 lần liên tiếp qua Nginx round-robin sẽ thấy
+> `history_length` nhảy cóc: **mỗi request thấy một con số khác nhau, không
+> tăng đều**.
+>
+> Cụ thể: Nginx round-robin có thể gửi request 1 → container A, request 2
+> → container C, request 3 → container B. Mỗi container có **RAM riêng**,
+> dict `_HISTORY` riêng. Container A chỉ thấy những request rơi vào nó —
+> đối với các request 2, 3, 4, 5, history của user đó trong container A
+> trống rỗng (vì user chưa từng gọi tới A trước đó). Kết quả quan sát
+> được:
+>
+> - Request rơi vào container A lần đầu: `history_length = 0` → sau khi
+>   xử lý tăng thành 2 (1 user + 1 assistant).
+> - Request tiếp theo rơi vào container C: `history_length = 0` (vì C
+>   chưa từng gặp user này) → xử lý xong tăng thành 2 (chỉ trong C).
+> - Request rơi vào B: tương tự, thấy `0` → `2`.
+> - Request rơi lại vào A: thấy `2` (từ lần trước) → tăng thành `4` —
+>   nhưng chỉ là 2 message mới nhất mà A biết, **không phải 4 message từ
+>   đầu phiên**.
+> - Một số request có thể thấy `0` dù trước đó user đã chat 3 lần, vì
+>   chưa lần nào rơi đúng vào container đã từng phục vụ user đó.
+>
+> Hậu quả thực tế:
+> 1. **LLM mất context**: user nói "tiếp tục như câu trước" mà container
+>    đang phục vụ không biết "câu trước" là gì.
+> 2. **Trả lời lặp lại**: assistant trả lời y như lần đầu dù user đã hỏi
+>    câu đó trước đó (ở container khác).
+> 3. **Container restart = mất sạch**: chỉ cần 1 trong 3 container restart
+>    (vì OOM, deploy phiên bản mới, K8s rolling update) thì dict `_HISTORY`
+>    của nó reset về rỗng, dù Redis chưa bao giờ mất.
+> 4. **Không thể scale**: thêm container thứ 4, 5 → các container mới hoàn
+>    toàn "trắng" về mọi user, mọi request rơi vào đó đều thấy
+>    `history_length = 0`.
+>
+> Đây chính là lý do `tests/test_cp4.py::TestStateless::test_khong_co_bien_toan_cuc_giu_state`
+> quét source bằng regex tìm pattern `history = {}` / `chat = dict()` —
+> bắt buộc phải đưa state ra khỏi process. Tôi đã verify bằng cách mô
+> phỏng 3 `ChatStore` instance dùng chung 1 fakeredis: `history_length`
+> tăng đều 0 → 2 → 4 → 6 → 8 → 10 dù request rơi vào container nào.
+> Stateless hoạt động đúng.
 
 ---
 
