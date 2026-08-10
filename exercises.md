@@ -443,4 +443,59 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-> *Câu trả lời của bạn*
+> **Lỗi 1: `$PORT` không được expand khi dùng Dockerfile trên Railway**
+>
+> **Thông báo lỗi:**
+> ```
+> Error: Invalid value for '--port': '$PORT' is not a valid integer.
+> Error: Invalid value for '--port': '${PORT:-8000}' is not a valid integer.
+> ```
+>
+> **Nguyên nhân:** Khi dùng Dockerfile, Railway không tự gán biến `PORT`
+> như khi dùng Nixpacks/Buildpack. Giá trị literal `$PORT` hoặc `${PORT:-8000}`
+> được truyền thẳng cho uvicorn thay vì shell expansion. Ngoài ra, ngay cả
+> khi thêm `${PORT:-8000}` vào `railway.toml`, Railway không chạy shell
+> expansion cho `startCommand` — nó chạy uvicorn trực tiếp với chuỗi
+> `${PORT:-8000}` như một string.
+>
+> **Cách tìm ra:** Đọc log trên Railway dashboard, thấy rõ giá trị
+> `${PORT:-8000}` được in ra nguyên văn trong error message.
+>
+> **Cách sửa:** Thêm biến `PORT=10000` trong Railway dashboard → Variables
+> của service. Railway sẽ inject biến này vào container environment,
+> shell expansion trong `CMD ["sh", "-c", "..."]` của Dockerfile sẽ hoạt
+> động đúng.
+>
+> ---
+>
+> **Lỗi 2: `ValidationError: api_token Field required` trên Render**
+>
+> **Thông báo lỗi:**
+> ```
+> pydantic_core._pydantic_core.ValidationError: 1 validation error for Settings
+> api_token
+>   Field required [type=missing, input_value={'port': '10000', 'redis_...'}]
+> ```
+>
+> **Nguyên nhân:** Trên Render, tôi đã set `PORT=10000` trong `render.yaml`
+> và tạo Redis, nhưng quên set biến `API_TOKEN` trong dashboard của service
+> `day12-chat`. Pydantic Settings yêu cầu `api_token` là field bắt buộc
+> (không có default), nên app crash ngay khi khởi động với
+> `ValidationError`.
+>
+> **Cách tìm ra:** Đọc Render deploy log, thấy traceback chỉ rõ
+> `api_token Field required` trong `Settings.__init__()`.
+>
+> **Cách sửa:** Vào Render Dashboard → service `day12-chat` → Environment →
+> thêm biến `API_TOKEN` với giá trị từ OpenAI dashboard. Sau đó redeploy.
+>
+> ---
+>
+> **Bài học rút ra:**
+> - Mỗi platform (Railway, Render, Cloud Run) có cách handle environment
+>   variable khác nhau khi dùng Dockerfile. Không thể giả định chúng hoạt
+>   động giống nhau.
+> - Railway: không auto-set PORT khi dùng Dockerfile → phải set thủ công.
+> - Render: biến reference syntax `${{service.VAR}}` không hoạt động như
+>   kỳ vọng → phải dùng dropdown để reference hoặc set trực tiếp.
+> - Luôn đọc log output để tìm root cause thay vì đoán mò.
